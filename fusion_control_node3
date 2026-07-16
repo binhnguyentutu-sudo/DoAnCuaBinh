@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import math
+import rospy
+import serial
+from sensor_msgs.msg import LaserScan
+from kinect_line_detector.msg import LineData
+
+MODE_LINE_FOLLOWING = 0
+MODE_OBSTACLE_AVOIDANCE = 1
+MODE_SAFE_STOP = 2
+
+ANG_STRAIGHT = "straight"
+ANG_LEFT = "left"
+ANG_RIGHT = "right"
+
+
+class FusionControlNode(object):
+    def __init__(self):
+        rospy.init_node("fusion_control_node")
+
+        # --- Tham so Serial ---
+        self.port = rospy.get_param("~port", "/dev/arduino")
+        self.baudrate = rospy.get_param("~baudrate", 115200)
+
+        # --- Tham so vung / nguong khoang cach (dung cho chuyen mode) ---
+        self.robot_width = rospy.get_param("~robot_width", 0.40)
+        self.margin_a2 = rospy.get_param("~margin_a2", 0.05)
+        self.enter_dist = rospy.get_param("~enter_dist", 0.40)
+        self.exit_dist = rospy.get_param("~exit_dist", 0.60)
+        self.half_corridor = self.robot_width / 2.0 + self.margin_a2
+
+        # --- Tham so goc (vung dem hysteresis, dung cho chuyen mode) ---
+        self.straight_ang_th = rospy.get_param("~straight_ang_th", 10.0)
+        self.ang_hysteresis = rospy.get_param("~ang_hysteresis", 5.0)
+
+        # --- Tham so exit theo line ---
+        self.err_exit_th = rospy.get_param("~err_exit_th", 0.05)
+
+        # --- Debounce chuyen mode ---
+        self.debounce_frames = rospy.get_param("~debounce_frames", 4)
+        self.enter_count = 0
+        self.exit_count = 0
+
+        # --- Timeout an toan ---
+        self.data_timeout = rospy.get_param("~data_timeout", 0.5)
+
+        # --- Tham so thuat toan truong the (huong lai) ---
+        self.g_obs = rospy.get_param("~g_obs", 0.50)
+        self.g_star = rospy.get_param("~g_star", 0.60)
+        self.k_A = rospy.get_param("~k_A", 1.0)
+        self.k_R = rospy.get_param("~k_R", 0.03)
+        self.d_off = rospy.get_param("~d_off", 0.15)
+        self.side_lock_frames = rospy.get_param("~side_lock_frames", 3)
+
+        # --- Tham so dieu khien v, w (thay cho ang co dinh) ---
+        self.v_max_avoid = rospy.get_param("~v_max_avoid", 0.4)     # m/s
+        self.v_min_avoid = rospy.get_param("~v_min_avoid", 0.1)     # m/s
+        self.safety_min_dist = rospy.get_param("~safety_min_dist", 0.15)  # m, gan nhat chap nhan
+        self.k_theta = rospy.get_param("~k_theta", 1.5)             # he so P: rad/s tren rad lech
+        self.w_max = rospy.get_param("~w_max", 1.5)                 # rad/s, gioi han co khi
+        self.w_smooth_alpha = rospy.get_param("~w_smooth_alpha", 0.3)  # loc mem w
+
+        self.avoid_side_state = None
+        self.side_buffer = []
+        self.avoid_w_prev = 0.0
+        self.avoid_v_prev = self.v_min_avoid
+
+        # --- State machine ---
+        self.mode = MODE_LINE_FOLLOWING
+        self.ang_state = ANG_STRAIGHT
+
+        # --- Du lieu moi nhat ---
+        self.last_line = None
+        self.last_scan = None
+
+        # --- Ket noi Serial ---
+        self.ser = None
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, write_timeout=0.05)
+            rospy.loginfo("Da mo cong Serial, cho Arduino reset...")
+            rospy.sleep(2.0)
+            rospy.loginfo("Da ket noi Serial tai %s @ %d", self.port, self.baudrate)
+        except serial.SerialException as e:
+            rospy.logerr("Khong the mo Serial %s: %s", self.port, str(e))
+
+        # --- Subscriber ---
+        rospy.Subscriber("/kinect/line_data", LineData, self.line_callback, queue_size=1)
+        rospy.Subscriber("/scan", LaserScan, self.scan_callback, queue_size=1)
+
+        # --- Timer dieu phoi ---
+        control_rate = rospy.get_param("~control_rate", 20.0)
+        rospy.Timer(rospy.Duration(1.0 / control_rate), self.control_loop)
+
+        rospy.loginfo("fusion_control_node da san sang.")
+
+    # ------------------------------------------------------------------
+    def line_callback(self, msg):
+        self.last_line = msg
+
+    def scan_callback(self, msg):
+        self.last_scan = msg
+
+    # ------------------------------------------------------------------
+    def classify_zones(self, scan_msg):
+        min_A = min_B = min_C = float('inf')
+        for i, r in enumerate(scan_msg.ranges):
+            if not math.isfinite(r):
+                continue
+            if r < scan_msg.range_min or r > scan_msg.range_max:
+                continue
+            angle = scan_msg.angle_min + i * scan_msg.angle_increment
+            if angle < -math.pi / 2 or angle > math.pi / 2:
+                continue
+
+            x = -r * math.sin(angle)
+            y = r * math.cos(angle)
+            if y <= 0:
+                continue
+
+            if -self.half_corridor <= x <= self.half_corridor:
+                min_A = min(min_A, r)
+            elif x < -self.half_corridor:
+                min_B = min(min_B, r)
+            else:
+                min_C = min(min_C, r)
+        return min_A, min_B, min_C
+
+    # ------------------------------------------------------------------
+    def update_ang_state(self, ang):
+        th = self.straight_ang_th
+        hys = self.ang_hysteresis
+
+        if self.ang_state == ANG_STRAIGHT:
+            if ang > th + hys:
+                self.ang_state = ANG_RIGHT
+            elif ang < -(th + hys):
+                self.ang_state = ANG_LEFT
+        elif self.ang_state == ANG_RIGHT:
+            if ang < th - hys:
+                self.ang_state = ANG_STRAIGHT
+        elif self.ang_state == ANG_LEFT:
+            if ang > -(th - hys):
+                self.ang_state = ANG_STRAIGHT
+
+        return self.ang_state
+
+    # ------------------------------------------------------------------
+    def should_enter_avoidance(self, min_A, min_B, min_C, ang_state):
+        has_A = min_A < self.enter_dist
+        has_B = min_B < self.enter_dist
+        has_C = min_C < self.enter_dist
+
+        if has_A and ang_state == ANG_STRAIGHT:
+            return True
+        if (has_A or has_B) and ang_state == ANG_LEFT:
+            return True
+        if (has_A or has_C) and ang_state == ANG_RIGHT:
+            return True
+        return False
+
+    def should_exit_avoidance(self, min_A, min_B, min_C, line_msg):
+        if line_msg is None or line_msg.state <= 0:
+            return False
+        if abs(line_msg.error) >= self.err_exit_th:
+            return False
+        if min_A <= self.exit_dist or min_B <= self.exit_dist or min_C <= self.exit_dist:
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def compute_avoidance_cmd(self):
+        """Tra ve (v, w): v (m/s) toc do tien, w (rad/s) van toc goc.
+        Chi dung khi self.mode == MODE_OBSTACLE_AVOIDANCE.
+        """
+        scan = self.last_scan
+        if scan is None:
+            return self.avoid_v_prev, self.avoid_w_prev
+
+        alphas, gs = [], []
+        for i, r in enumerate(scan.ranges):
+            if not math.isfinite(r):
+                continue
+            if r < scan.range_min or r > scan.range_max:
+                continue
+            angle = scan.angle_min + i * scan.angle_increment
+            if angle < -math.pi / 2 or angle > math.pi / 2:
+                continue
+            alphas.append(angle)
+            gs.append(r)
+
+        if not gs:
+            return self.avoid_v_prev, self.avoid_w_prev
+
+        # --- O: diem vat can gan nhat ---
+        idx_O = min(range(len(gs)), key=lambda k: gs[k])
+        g_O = gs[idx_O]
+        alpha_O = alphas[idx_O]
+        u_O = g_O * math.cos(alpha_O)
+        w_O = g_O * math.sin(alpha_O)
+
+        # --- Toc do v: theo do gan cua vat can thuc te (m), doc lap voi F ---
+        urgency = (self.enter_dist - g_O) / (self.enter_dist - self.safety_min_dist)
+        urgency = max(0.0, min(1.0, urgency))
+        v_cmd = self.v_max_avoid - urgency * (self.v_max_avoid - self.v_min_avoid)
+
+        # --- Phan B: phat hien dai vat can lien tiep g_i < g_obs ---
+        band_idx = [k for k, g in enumerate(gs) if g < self.g_obs]
+        if not band_idx:
+            return v_cmd, self.avoid_w_prev
+
+        segments, seg_start, prev = [], band_idx[0], band_idx[0]
+        for k in band_idx[1:]:
+            if k == prev + 1:
+                prev = k
+            else:
+                segments.append((seg_start, prev))
+                seg_start, prev = k, k
+        segments.append((seg_start, prev))
+        iL, iR = max(segments, key=lambda s: s[1] - s[0])
+
+        alpha_iL, alpha_iR = alphas[iL], alphas[iR]
+
+        # --- Phan C: chon mep, CHI CHON 1 LAN, lay trung binh vai frame dau ---
+        if self.avoid_side_state is None:
+            self.side_buffer.append((alpha_iL, alpha_iR))
+
+            if len(self.side_buffer) < self.side_lock_frames:
+                return self.v_min_avoid, 0.0
+
+            avg_alpha_iL = sum(a for a, _ in self.side_buffer) / len(self.side_buffer)
+            avg_alpha_iR = sum(b for _, b in self.side_buffer) / len(self.side_buffer)
+            self.avoid_side_state = 'L' if abs(avg_alpha_iL) < abs(avg_alpha_iR) else 'R'
+            self.side_buffer = []
+            rospy.loginfo("Da chot mep ne: %s (avg_aL=%.1f deg, avg_aR=%.1f deg)",
+                        self.avoid_side_state,
+                        math.degrees(avg_alpha_iL), math.degrees(avg_alpha_iR))
+
+        side = self.avoid_side_state
+
+        if side == 'L':
+            i_edge, i_neighbor = iL, max(iL - 1, 0)
+        else:
+            i_edge, i_neighbor = iR, min(iR + 1, len(gs) - 1)
+
+        alpha_edge, g_edge = alphas[i_edge], gs[i_edge]
+        u_E = g_edge * math.cos(alpha_edge)
+        w_E = g_edge * math.sin(alpha_edge)
+
+        u_n = gs[i_neighbor] * math.cos(alphas[i_neighbor])
+        w_n = gs[i_neighbor] * math.sin(alphas[i_neighbor])
+
+        Tu, Tw = (u_E - u_n), (w_E - w_n)
+        Tlen = math.hypot(Tu, Tw)
+        if Tlen < 1e-6:
+            Nu, Nw = 0.0, (1.0 if side == 'L' else -1.0)
+        else:
+            Tu, Tw = Tu / Tlen, Tw / Tlen
+            Nu1, Nw1 = -Tw, Tu
+            Nu2, Nw2 = Tw, -Tu
+            dot1 = Nu1 * u_E + Nw1 * w_E
+            dot2 = Nu2 * u_E + Nw2 * w_E
+            Nu, Nw = (Nu1, Nw1) if dot1 > dot2 else (Nu2, Nw2)
+
+        u_D = u_E + self.d_off * Nu
+        w_D = w_E + self.d_off * Nw
+
+        # --- Phan D: luc hut + luc day ---
+        Fu_A = self.k_A * u_D
+        Fw_A = self.k_A * w_D
+
+        if 1e-3 < g_O <= self.g_star:
+            coef = self.k_R * (1.0 / self.g_star - 1.0 / g_O) * (1.0 / (g_O ** 3))
+            Fu_R, Fw_R = coef * u_O, coef * w_O
+        else:
+            Fu_R = Fw_R = 0.0
+
+        Fu, Fw = Fu_A + Fu_R, Fw_A + Fw_R
+
+        # --- Phan E: dieu khien, tra ve w (rad/s) thay vi ang (do) ---
+        theta_D_rad = math.atan2(Fw, Fu)   # da la goc lech tuong doi, radian
+        w_cmd = self.k_theta * theta_D_rad
+        w_cmd = max(-self.w_max, min(self.w_max, w_cmd))
+
+        w_smooth = (self.w_smooth_alpha * w_cmd
+                    + (1 - self.w_smooth_alpha) * self.avoid_w_prev)
+        self.avoid_w_prev = w_smooth
+        self.avoid_v_prev = v_cmd
+
+        return v_cmd, w_smooth
+
+    # ------------------------------------------------------------------
+    def check_data_fresh(self):
+        now = rospy.Time.now()
+        if self.last_scan is None or (now - self.last_scan.header.stamp).to_sec() > self.data_timeout:
+            return False
+        if self.last_line is None or (now - self.last_line.header.stamp).to_sec() > self.data_timeout:
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def control_loop(self, event):
+        if not self.check_data_fresh():
+            rospy.logwarn_throttle(1.0, "Mat du lieu cam bien (qua %.2fs), DUNG XE", self.data_timeout)
+            self.send_avoid_cmd(0.0, 0.0, MODE_SAFE_STOP)
+            self.enter_count = 0
+            self.exit_count = 0
+            return
+
+        min_A, min_B, min_C = self.classify_zones(self.last_scan)
+        ang_state = self.update_ang_state(self.last_line.angle)
+
+        if self.mode == MODE_LINE_FOLLOWING:
+            if self.should_enter_avoidance(min_A, min_B, min_C, ang_state):
+                self.enter_count += 1
+            else:
+                self.enter_count = 0
+
+            if self.enter_count >= self.debounce_frames:
+                self.mode = MODE_OBSTACLE_AVOIDANCE
+                self.enter_count = 0
+                self.exit_count = 0
+                self.avoid_side_state = None
+                self.side_buffer = []
+                self.avoid_w_prev = 0.0
+                self.avoid_v_prev = self.v_min_avoid
+                rospy.logwarn("Chuyen mode: LINE_FOLLOWING -> OBSTACLE_AVOIDANCE "
+                               "(A=%.2f B=%.2f C=%.2f ang_state=%s)",
+                               min_A, min_B, min_C, ang_state)
+
+        elif self.mode == MODE_OBSTACLE_AVOIDANCE:
+            if self.should_exit_avoidance(min_A, min_B, min_C, self.last_line):
+                self.exit_count += 1
+            else:
+                self.exit_count = 0
+
+            if self.exit_count >= self.debounce_frames:
+                self.mode = MODE_LINE_FOLLOWING
+                self.enter_count = 0
+                self.exit_count = 0
+                rospy.logwarn("Chuyen mode: OBSTACLE_AVOIDANCE -> LINE_FOLLOWING")
+
+        if self.mode == MODE_LINE_FOLLOWING:
+            self.send_line_cmd(self.last_line.angle, self.last_line.error,
+                                self.last_line.state, self.last_line.curve)
+        else:
+            v, w = self.compute_avoidance_cmd()
+            self.send_avoid_cmd(v, w, self.mode)
+
+    # ------------------------------------------------------------------
+    def send_line_cmd(self, ang, error, state, curve):
+        """Format cho MODE_LINE_FOLLOWING: @ang#error#state#curve#mode#"""
+        if self.ser is None or not self.ser.is_open:
+            rospy.logwarn_throttle(1.0, "Serial chua san sang, khong gui duoc")
+            return
+        try:
+            msg = "@%d#%.4f#%d#%.4f#%d#\n" % (int(ang), error, int(state), curve, MODE_LINE_FOLLOWING)
+            self.ser.write(msg.encode())
+            rospy.loginfo_throttle(1.0, "Da gui (LINE): %s", msg.strip())
+        except serial.SerialTimeoutException:
+            rospy.logwarn_throttle(1.0, "Serial write timeout")
+        except serial.SerialException as e:
+            rospy.logerr_throttle(1.0, "Loi Serial: %s", str(e))
+
+    def send_avoid_cmd(self, v, w, mode):
+        """Format cho MODE_OBSTACLE_AVOIDANCE va MODE_SAFE_STOP: @v#w#mode#"""
+        if self.ser is None or not self.ser.is_open:
+            rospy.logwarn_throttle(1.0, "Serial chua san sang, khong gui duoc")
+            return
+        try:
+            msg = "@%.3f#%.3f#%d#\n" % (v, w, int(mode))
+            self.ser.write(msg.encode())
+            rospy.loginfo_throttle(1.0, "Da gui (AVOID/STOP): %s", msg.strip())
+        except serial.SerialTimeoutException:
+            rospy.logwarn_throttle(1.0, "Serial write timeout")
+        except serial.SerialException as e:
+            rospy.logerr_throttle(1.0, "Loi Serial: %s", str(e))
+
+    # ------------------------------------------------------------------
+    def shutdown(self):
+        self.send_avoid_cmd(0.0, 0.0, MODE_SAFE_STOP)
+        if self.ser is not None and self.ser.is_open:
+            self.ser.close()
+
+
+if __name__ == "__main__":
+    node = FusionControlNode()
+    rospy.on_shutdown(node.shutdown)
+    rospy.spin()
